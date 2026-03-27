@@ -2,8 +2,6 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-import json
-from typing import List, Dict
 import os
 
 # RAG Components
@@ -15,7 +13,7 @@ from langchain_core.runnables import RunnablePassthrough
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import PointStruct, VectorParams, Distance
-import qdrant_client
+import qdrant_client.http.models as models
 
 # Page config
 st.set_page_config(
@@ -26,42 +24,48 @@ st.set_page_config(
 )
 
 @st.cache_resource
-def init_qdrant():
-    """Initialize Qdrant client and collections"""
+def init_qdrant(embed_dim: int):
+    """Initialize Qdrant with correct embedding dimension"""
     client = QdrantClient(":memory:")
     
-    client.recreate_collection(
-        collection_name="conversion_data",
-        vectors_config=VectorParams(size=1536, distance=Distance.COSINE),  # OpenAI dim
-    )
+    # Delete existing collections if wrong dimension
+    try:
+        client.delete_collection("conversion_data")
+        client.delete_collection("engagement_data")
+    except:
+        pass
     
-    client.recreate_collection(
+    # Create with correct dimension
+    client.create_collection(
+        collection_name="conversion_data",
+        vectors_config=VectorParams(size=embed_dim, distance=Distance.COSINE),
+    )
+    client.create_collection(
         collection_name="engagement_data",
-        vectors_config=VectorParams(size=1536, distance=Distance.COSINE),
+        vectors_config=VectorParams(size=embed_dim, distance=Distance.COSINE),
     )
     
     return client
 
 @st.cache_data
 def generate_sample_data():
-    """Generate 150+ sample records (unchanged)"""
+    """Generate sample data - FIXED"""
     np.random.seed(42)
     dates = pd.date_range('2025-01-01', periods=100, freq='D')
-    
     campaigns = [f'Campaign_{i:03d}' for i in range(1, 31)]
     products = ['Product_A', 'Product_B', 'Product_C', 'Product_D', 'Product_E']
     
+    # Conversion data
     conversion_data = []
     for i in range(150):
         campaign = np.random.choice(campaigns)
         product = np.random.choice(products)
         date = np.random.choice(dates)
-        
         target_conversions = np.random.poisson(50)
         control_conversions = np.random.poisson(40)
         test_conversions = target_conversions + np.random.poisson(10)
         incremental = test_conversions - control_conversions
-        sales = np.random.poisson(1000) * (1 + incremental/100)
+        sales = np.random.poisson(1000) * (1 + incremental/100.0)
         
         conversion_data.append({
             'campaign_id': campaign,
@@ -71,24 +75,22 @@ def generate_sample_data():
             'control_conversions': control_conversions,
             'test_conversions': test_conversions,
             'incremental_lift': incremental,
-            'sales_revenue': sales,
-            'conversion_rate': test_conversions / (target_conversions + 1) * 100,
-            'roi': sales / (target_conversions * 10)
+            'sales_revenue': float(sales),
+            'conversion_rate': round(test_conversions / max(target_conversions, 1) * 100, 2),
+            'roi': round(sales / max(target_conversions * 10, 1), 2)
         })
     
-    channels = ['Email', 'Social_Facebook', 'Social_Instagram', 'Social_LinkedIn', 
-               'Display', 'Search', 'Video', 'SMS']
-    
+    # Engagement data
+    channels = ['Email', 'Social_Facebook', 'Social_Instagram', 'Social_LinkedIn', 'Display', 'Search', 'Video', 'SMS']
     engagement_data = []
     for i in range(120):
         campaign = np.random.choice(campaigns)
         channel = np.random.choice(channels)
         date = np.random.choice(dates)
-        
         impressions = np.random.poisson(50000)
-        clicks = np.random.poisson(impressions * 0.02)
-        engagements = np.random.poisson(clicks * 0.3)
-        conversions = np.random.poisson(engagements * 0.05)
+        clicks = np.random.poisson(int(impressions * 0.02))
+        engagements = np.random.poisson(int(clicks * 0.3))
+        conversions = np.random.poisson(int(engagements * 0.05))
         
         engagement_data.append({
             'campaign_id': campaign,
@@ -96,198 +98,220 @@ def generate_sample_data():
             'date': date.strftime('%Y-%m-%d'),
             'impressions': impressions,
             'clicks': clicks,
-            'ctr': clicks / (impressions + 1) * 100,
+            'ctr': round(clicks / max(impressions, 1) * 100, 2),
             'engagements': engagements,
-            'engagement_rate': engagements / (clicks + 1) * 100,
+            'engagement_rate': round(engagements / max(clicks, 1) * 100, 2),
             'conversions': conversions,
-            'cvr': conversions / (engagements + 1) * 100,
-            'cost_per_click': np.random.uniform(0.5, 3.0),
-            'cost_per_conversion': np.random.uniform(20, 80)
+            'cvr': round(conversions / max(engagements, 1) * 100, 2),
+            'cost_per_click': round(np.random.uniform(0.5, 3.0), 2),
+            'cost_per_conversion': round(np.random.uniform(20, 80), 0)
         })
     
     return pd.DataFrame(conversion_data), pd.DataFrame(engagement_data)
 
-def create_vectors(client: QdrantClient, df: pd.DataFrame, collection_name: str, embeddings):
-    """Convert DataFrame to text documents and store in Qdrant"""
+def create_vectors(client, df, collection_name, embeddings):
+    """Create and index vectors - FIXED"""
     documents = []
     for _, row in df.iterrows():
-        text = f"Campaign: {row['campaign_id']}, "
-        text += f"Date: {row.get('date', 'N/A')}, "
+        text = f"Campaign: {row['campaign_id']} | "
+        if 'date' in row:
+            text += f"Date: {row['date']} | "
         
         if collection_name == "conversion_data":
-            text += (f"Product: {row['product']}, Target Conversions: {row['target_conversions']}, "
-                    f"Control: {row['control_conversions']}, Test: {row['test_conversions']}, "
-                    f"Incremental Lift: {row['incremental_lift']}, Sales: ${row['sales_revenue']:,.0f}, "
-                    f"Conversion Rate: {row['conversion_rate']:.1f}%, ROI: {row['roi']:.2f}")
+            text += (f"Product: {row['product']} | Target: {row['target_conversions']} | "
+                    f"Control: {row['control_conversions']} | Test: {row['test_conversions']} | "
+                    f"Lift: {row['incremental_lift']} | Sales: ${row['sales_revenue']:,.0f} | "
+                    f"Conv Rate: {row['conversion_rate']}% | ROI: {row['roi']}")
         else:
-            text += (f"Channel: {row['channel']}, Impressions: {row['impressions']:,}, "
-                    f"Clicks: {row['clicks']:,}, CTR: {row['ctr']:.2f}%, "
-                    f"Engagements: {row['engagements']:,}, Engagement Rate: {row['engagement_rate']:.1f}%, "
-                    f"Conversions: {row['conversions']}, CVR: {row['cvr']:.1f}%, "
-                    f"Cost/Click: ${row['cost_per_click']:.2f}, Cost/Conversion: ${row['cost_per_conversion']:.0f}")
+            text += (f"Channel: {row['channel']} | Impressions: {row['impressions']:,} | "
+                    f"Clicks: {row['clicks']:,} | CTR: {row['ctr']}% | "
+                    f"Engagements: {row['engagements']:,} | Eng Rate: {row['engagement_rate']}% | "
+                    f"Conversions: {row['conversions']} | CVR: {row['cvr']}% | "
+                    f"CPC: ${row['cost_per_click']} | CPA: ${row['cost_per_conversion']}")
         
         documents.append(text)
     
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
-    splits = text_splitter.create_documents([doc for doc in documents])
+    # Simple splitting
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
+    splits = text_splitter.create_documents(documents)
     
     points = []
     for i, doc in enumerate(splits):
-        embedding = embeddings.embed_query(doc.page_content)
-        points.append(PointStruct(
-            id=i,
-            vector=embedding,
-            payload={"text": doc.page_content, "table": collection_name}
-        ))
+        try:
+            embedding = embeddings.embed_query(doc.page_content)
+            points.append(PointStruct(
+                id=i,
+                vector=embedding,
+                payload={"text": doc.page_content, "table": collection_name}
+            ))
+        except Exception as e:
+            st.warning(f"Skipping doc {i}: {str(e)[:100]}")
+            continue
     
-    client.upsert(collection_name=collection_name, points=points)
+    if points:
+        client.upsert(collection_name=collection_name, points=points)
     return len(points)
 
-def get_model_components(model_provider: str):
-    """Get embeddings and LLM based on selected provider"""
-    if model_provider == "OpenAI":
-        api_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
-        if not api_key:
-            st.error("❌ OpenAI API key not found in secrets!")
-            st.stop()
-        
-        return (
-            OpenAIEmbeddings(model="text-embedding-3-small", openai_api_key=api_key),
-            ChatOpenAI(model="gpt-4o-mini", temperature=0, openai_api_key=api_key),
-            1536
-        )
-    else:  # Gemini
-        api_key = st.secrets.get("GEMINI_API_KEY", os.getenv("GEMINI_API_KEY"))
-        if not api_key:
-            st.error("❌ Gemini API key not found in secrets!")
-            st.stop()
-        
-        return (
-            GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=api_key),
-            ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0, google_api_key=api_key),
-            768
-        )
+def get_model_components(model_provider):
+    """Get model components with error handling"""
+    try:
+        if model_provider == "OpenAI":
+            api_key = st.secrets.get("OPENAI_API_KEY")
+            if not api_key:
+                st.error("❌ Add OPENAI_API_KEY to Streamlit Secrets")
+                st.stop()
+            return (
+                OpenAIEmbeddings(model="text-embedding-3-small", dimensions=1536),
+                ChatOpenAI(model="gpt-4o-mini", temperature=0),
+                1536,
+                "gpt-4o-mini"
+            )
+        else:  # Gemini
+            api_key = st.secrets.get("GEMINI_API_KEY")
+            if not api_key:
+                st.error("❌ Add GEMINI_API_KEY to Streamlit Secrets")
+                st.stop()
+            return (
+                GoogleGenerativeAIEmbeddings(model="models/embedding-001"),
+                ChatGoogleGenerativeAI(model="gemini-2.5-flash-lite", temperature=0),
+                768,
+                "gemini-1.5-flash"
+            )
+    except Exception as e:
+        st.error(f"Model setup error: {str(e)}")
+        st.stop()
 
-def setup_rag_system(model_provider: str):
-    """Initialize complete RAG system with selected model"""
-    embeddings, llm, embed_dim = get_model_components(model_provider)
-    client = init_qdrant()
+@st.cache_resource
+def setup_rag_system(_model_provider, _embed_dim):
+    """Complete RAG setup with proper caching"""
+    model_provider = _model_provider
+    embed_dim = _embed_dim
     
+    embeddings, llm, dim, model_name = get_model_components(model_provider)
+    client = init_qdrant(embed_dim)
+    
+    # Check if indexed
     if client.get_collection("conversion_data").points_count == 0:
         conv_df, eng_df = generate_sample_data()
         st.session_state.conv_df = conv_df
         st.session_state.eng_df = eng_df
         
-        create_vectors(client, conv_df, "conversion_data", embeddings)
-        create_vectors(client, eng_df, "engagement_data", embeddings)
-        st.success(f"✅ {model_provider} RAG System Ready!")
+        conv_count = create_vectors(client, conv_df, "conversion_data", embeddings)
+        eng_count = create_vectors(client, eng_df, "engagement_data", embeddings)
+        
+        st.success(f"✅ Indexed {conv_count} conv + {eng_count} eng docs")
     
     return client, embeddings, llm
 
 def format_docs(docs):
-    return "\n\n".join(doc.payload["text"] for doc in docs)
+    return "\n\n".join([doc.payload["text"] for doc in docs])
 
-@st.cache_resource
-def create_rag_chain(client, embeddings, llm, _model_provider):
-    def retrieve_docs(query, k=5):
-        search_results = []
+def create_rag_chain(client, embeddings, llm):
+    def retrieve_docs(query, k=6):
+        results = []
         for collection in ["conversion_data", "engagement_data"]:
-            hits = client.search(
-                collection_name=collection,
-                query_vector=embeddings.embed_query(query),
-                limit=k,
-                query_filter=None
-            )
-            search_results.extend(hits)
-        return search_results[:k]
+            try:
+                hits = client.search(
+                    collection_name=collection,
+                    query_vector=embeddings.embed_query(query),
+                    limit=k
+                )
+                results.extend(hits)
+            except:
+                continue
+        return sorted(results, key=lambda x: x.score, reverse=True)[:k]
     
-    def rag_chain(query):
+    def chain(query):
         docs = retrieve_docs(query)
-        context = format_docs(docs)
+        if not docs:
+            return "No relevant data found. Try rephrasing your question."
         
-        prompt = ChatPromptTemplate.from_template(
-            """You are a marketing analytics expert. Use only the provided campaign data context to answer.
+        context = format_docs(docs)
+        prompt = ChatPromptTemplate.from_template("""
+You are a marketing analytics expert. Answer using ONLY this campaign data:
 
-Context from {table}:
+CONTEXT:
 {context}
 
-Question: {question}
+QUESTION: {question}
 
-Answer with specific numbers, trends, and insights from the data."""
-        )
+Provide specific numbers, comparisons, trends, and recommendations from the data.
+""")
         
-        chain = (
-            {"context": RunnablePassthrough(), "question": RunnablePassthrough(), "table": RunnablePassthrough()}
+        full_chain = (
+            {"context": RunnablePassthrough(), "question": RunnablePassthrough()}
             | prompt
             | llm
             | StrOutputParser()
         )
         
-        return chain.invoke({"context": context, "question": query, "table": "conversion & engagement tables"})
+        return full_chain.invoke({"context": context, "question": query})
     
-    return rag_chain
+    return chain
 
-# Streamlit UI
+# Main App
 def main():
-    st.title("🤖 Marketing RAG Agent - Multi-Model")
-    st.markdown("**Toggle between OpenAI GPT-4o-mini & Gemini 1.5 Flash**")
+    st.title("🤖 Marketing RAG Agent - FIXED")
+    st.markdown("*Toggle OpenAI ↔ Gemini | 270+ marketing records*")
     
-    # Sidebar - Model Selection
+    # Sidebar
     with st.sidebar:
-        st.header("🎯 Model Selection")
-        
-        model_options = ["OpenAI (GPT-4o-mini)", "Gemini 1.5 Flash"]
-        selected_model = st.selectbox("Choose LLM:", model_options, index=1)
+        st.header("⚙️ Model Selection")
+        model_options = ["OpenAI GPT-4o-mini", "Gemini 1.5 Flash"]
+        selected_model = st.radio("Choose model:", model_options, index=1)
         model_provider = "OpenAI" if "OpenAI" in selected_model else "Gemini"
         
-        st.info(f"**Selected:** {selected_model}")
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("🔄 Reset Data", type="secondary"):
+                st.cache_data.clear()
+                st.cache_resource.clear()
+                st.rerun()
         
-        if st.button("🔄 Rebuild Index", type="secondary"):
-            st.cache_data.clear()
-            st.cache_resource.clear()
-            st.rerun()
+        model_info = {
+            "OpenAI": {"dim": 1536, "name": "gpt-4o-mini"},
+            "Gemini": {"dim": 768, "name": "gemini-1.5-flash"}
+        }
+        st.info(f"**Model**: {model_info[model_provider]['name']} | **Dim**: {model_info[model_provider]['dim']}")
         
-        # Setup system
-        if 'system_setup' not in st.session_state or st.session_state.get('last_model') != model_provider:
-            with st.spinner(f"Setting up {model_provider} RAG..."):
-                st.session_state.client, st.session_state.embeddings, st.session_state.llm = setup_rag_system(model_provider)
-                st.session_state.system_setup = True
-                st.session_state.last_model = model_provider
+        # Setup
+        client_key = f"client_{model_provider}"
+        if client_key not in st.session_state:
+            with st.spinner(f"🚀 Setting up {model_provider}..."):
+                embed_dim = model_info[model_provider]["dim"]
+                st.session_state[client_key] = setup_rag_system(model_provider, embed_dim)
+                st.session_state.current_client_key = client_key
+        
+        client, embeddings, llm = st.session_state[st.session_state.current_client_key]
         
         # Data preview
         if 'conv_df' in st.session_state:
-            st.subheader("📋 Sample Data")
+            st.subheader("📊 Sample Data")
             col1, col2 = st.columns(2)
             with col1:
-                st.dataframe(st.session_state.conv_df.head(3), use_container_width=True)
+                st.dataframe(st.session_state.conv_df[['campaign_id', 'product', 'incremental_lift', 'roi']].head())
             with col2:
-                st.dataframe(st.session_state.eng_df.head(3), use_container_width=True)
+                st.dataframe(st.session_state.eng_df[['campaign_id', 'channel', 'ctr', 'cvr']].head())
     
-    # Chat interface
+    # Chat
     if 'messages' not in st.session_state:
         st.session_state.messages = []
     
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
+    for msg in st.session_state.messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
     
-    if prompt := st.chat_input("Ask about campaigns, ROI, CTR, channel performance..."):
+    if prompt := st.chat_input("💬 Ask: 'Best campaign ROI?' 'Facebook vs Instagram CTR?'"):
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
         
         with st.chat_message("assistant"):
-            with st.spinner(f"{'🤖' if model_provider=='OpenAI' else '⭐'} {model_provider} analyzing..."):
-                rag_chain = create_rag_chain(
-                    st.session_state.client, 
-                    st.session_state.embeddings, 
-                    st.session_state.llm,
-                    model_provider
-                )
+            with st.spinner("Analyzing..."):
+                rag_chain = create_rag_chain(client, embeddings, llm)
                 response = rag_chain(prompt)
                 st.markdown(response)
-            
-            st.session_state.messages.append({"role": "assistant", "content": response})
+                st.session_state.messages.append({"role": "assistant", "content": response})
 
 if __name__ == "__main__":
     main()
