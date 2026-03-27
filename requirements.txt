@@ -1,0 +1,10 @@
+streamlit
+pandas
+numpy
+qdrant-client
+langchain-google-genai
+langchain-openai
+langchain-core
+langchain-text-splitters
+python-dotenv
+tiktoken
