@@ -2,9 +2,17 @@ streamlit
 pandas
 numpy
 qdrant-client
-langchain-google-genai
+
+# FREE EMBEDDINGS
+sentence-transformers
+torch
+transformers
+
+# PAID CHAT MODELS
 langchain-openai
+langchain-google-genai
 langchain-core
+
+# Utilities
 langchain-text-splitters
-python-dotenv
-tiktoken
+accelerate
